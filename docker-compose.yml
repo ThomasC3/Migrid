@@ -1,5 +1,11 @@
 version: '3.8'
 
+networks:
+  migrid-internal:
+    driver: bridge
+  open-wallet-net:
+    driver: bridge
+
 services:
   # --- Layer 0: Data & State ---
   postgres:
@@ -7,17 +13,56 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTG-RES_USER: migrid
+      POSTGRES_USER: migrid
       POSTGRES_PASSWORD: dev_password_123
       POSTGRES_DB: migrid_core
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./scripts/migrations:/docker-entrypoint-initdb.d
+    networks:
+      - migrid-internal
 
   redis:
     image: redis:alpine
     ports:
       - "6379:6379"
+    networks:
+      - migrid-internal
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - migrid-internal
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - migrid-internal
+
+  # --- External Service: Open-Wallet Ledger (running on a separate network) ---
+  open-wallet:
+    build: ../open-wallet  # Relative path to the cloned open-wallet repo
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      NODE_ENV: development
+      # Assume open-wallet has its own DB, or it's configured internally.
+      # For this exercise, we're treating it as an external black box API.
+    networks:
+      - open-wallet-net
 
   # --- Layer 1: Physics Engine (Green Audit) ---
   physics-engine:
@@ -27,6 +72,8 @@ services:
     environment:
       DATABASE_URL: postgres://migrid:dev_password_123@postgres:5432/migrid_core
       REDIS_URL: redis://redis:6379
+    networks:
+      - migrid-internal
 
   # --- Layer 7: Device Gateway (OCPP) ---
   device-gateway:
@@ -35,6 +82,23 @@ services:
       - "9220:9220" # OCPP JSON WebSocket port
     depends_on:
       - redis
+    networks:
+      - migrid-internal
+
+  # --- Layer 10: Token Engine (Driver Incentives) ---
+  token-engine:
+    build: ./services/10-token-engine
+    depends_on:
+      - postgres
+      - kafka
+      - open-wallet
+    environment:
+      DATABASE_URL: postgres://migrid:dev_password_123@postgres:5432/migrid_core
+      KAFKA_BROKER: kafka:9092
+      OPEN_WALLET_API_URL: http://open-wallet:3000 
+    networks:
+      - migrid-internal
+      - open-wallet-net
 
 volumes:
   pg_data:
